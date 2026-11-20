@@ -1,0 +1,11 @@
+# Tsclp_v2.2_volatile
+# ВАЖНО: версия t-tech-investments зафиксирована (подтверждено pip show: 1.51.0).
+# grpcio зафиксирован (handoff: 1.85.1).
+t-tech-investments==1.51.0
+grpcio==1.85.1
+pandas>=2.0
+pandas-ta-classic>=0.3.14b
+python-telegram-bot>=20.0,<22.0
+python-dotenv>=1.0
+pytest>=7.0
+pytest-asyncio>=0.23

@@ -1,0 +1,369 @@
+# tests/test_main_helpers.py
+# Tsclp_v2.2_volatile — тесты вспомогательных функций main.py.
+# Обновлено: get_positions() → PositionData (лоты), _extract_price(.., lot_size).
+
+import csv
+import os
+import pytest
+from decimal import Decimal
+
+import main
+import logger as research_logger
+from execution import ExecutionMonitor, PositionState
+from tinkoff_client import PositionData
+
+
+def make_position(lots, direction="LONG"):
+    return PositionData(lots=lots, direction=direction, raw_shares=Decimal(lots))
+
+
+class FakeClient:
+    def __init__(self, positions=None):
+        self.positions = positions if positions is not None else {}
+        self.uncertain_state = False
+        self.order_states = {}
+
+    async def get_positions(self):
+        return self.positions
+
+    async def get_sandbox_order_state(self, order_id):
+        return self.order_states.get(order_id)
+
+    async def get_instrument_info(self, figi):
+        # Этап 5 (адопция RECOVERY в reconcile): метод требуется путю адопции
+        return {"lot": 1, "ticker": figi, "name": figi, "min_price_increment": 0.1,
+                "instrument_type": "share"}
+
+    def is_uncertain(self):
+        return self.uncertain_state
+
+
+def register_buy(mon, figi="FIGI", ticker="SBER", entry=100.0, qty=1, sl=99.0, tp=102.0, lot=1):
+    return mon.register(
+        figi=figi, ticker=ticker, direction="BUY",
+        entry_price=entry, quantity=qty, sl_price=sl, tp_price=tp,
+        lot_size=lot, trade_id="tid-" + figi,
+        entry_requested_lots=qty,
+    )
+
+
+# --- _trade_id_already_logged ---
+
+def test_trade_id_not_logged_empty_file(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+    research_logger._ensure_files()
+    assert main._trade_id_already_logged("abc") is False
+
+
+def test_trade_id_logged_present(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+    research_logger._ensure_files()
+    research_logger.log_trade({"trade_id": "abc", "ticker": "SBER"})
+    assert main._trade_id_already_logged("abc") is True
+    assert main._trade_id_already_logged("xyz") is False
+
+
+def test_trade_id_empty_returns_false():
+    assert main._trade_id_already_logged("") is False
+
+
+# --- reconcile ---
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_currency(monkeypatch):
+    client = FakeClient(positions={"RUB000UTSTOM": make_position(100000)})
+    mon = ExecutionMonitor(client)
+    await main.reconcile(client, mon)
+    assert main.reconcile_done is True
+    assert client.uncertain_state is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_empty_portfolio_clears_uncertain(monkeypatch):
+    client = FakeClient(positions={})
+    client.uncertain_state = True
+    mon = ExecutionMonitor(client)
+    await main.reconcile(client, mon)
+    assert main.reconcile_done is True
+    assert client.uncertain_state is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_unknown_position_adopted_as_recovery(monkeypatch, tmp_path):
+    """Обновлён (пояснение в шапке скрипта/диффа): по согласованному поведению
+    позиция брокера без локального учёта адоптируется в RECOVERY через
+    единую точку регистрации, а не вечно остаётся MISMATCH/UNCERTAIN."""
+    client = FakeClient(positions={"BBG004730N88": make_position(1)})
+    mon = ExecutionMonitor(client)
+    monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
+    await main.reconcile(client, mon)
+    # Адопция: позиция зарегистрирована и управляема (RECOVERY)
+    pos = mon.get_position("BBG004730N88")
+    assert pos is not None
+    assert pos.state == PositionState.RECOVERY
+    assert pos.quantity == 1
+    assert pos.direction == "BUY"
+    # Направление/количество совпадают — свека завершена
+    assert client.uncertain_state is False
+    assert main.reconcile_done is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_known_position_ok(monkeypatch):
+    client = FakeClient(positions={"FIGI": make_position(1)})
+    mon = ExecutionMonitor(client)
+    register_buy(mon)
+    await main.reconcile(client, mon)
+    assert client.uncertain_state is False
+    assert main.reconcile_done is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_closed_but_present_adopted_as_recovery(monkeypatch, tmp_path):
+    """Обновлён (пояснение в шапке скрипта/диффа): CLOSED-запись не является
+    активным учётом; присутствующая у брокера позиция адоптируется в RECOVERY."""
+    client = FakeClient(positions={"FIGI": make_position(1)})
+    mon = ExecutionMonitor(client)
+    pos = register_buy(mon)
+    pos.state = PositionState.CLOSED
+    monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
+    await main.reconcile(client, mon)
+    adopted = mon.get_position("FIGI")
+    assert adopted is not None
+    assert adopted.state == PositionState.RECOVERY
+    assert adopted.quantity == 1
+    assert client.uncertain_state is False
+    assert main.reconcile_done is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_duplicate_local(monkeypatch):
+    client = FakeClient(positions={"FIGI": make_position(1)})
+    mon = ExecutionMonitor(client)
+    register_buy(mon)
+    n_before = len(mon.positions)
+    await main.reconcile(client, mon)
+    await main.reconcile(client, mon)
+    assert len(mon.positions) == n_before
+
+
+@pytest.mark.asyncio
+async def test_reconcile_positions_none_keeps_uncertain():
+    """get_positions() = None (ошибка API) → uncertain_state не снимается."""
+    class ClientNone:
+        uncertain_state = True
+        async def get_positions(self):
+            return None
+    mon = ExecutionMonitor(ClientNone())
+    await main.reconcile(ClientNone(), mon)
+    assert ClientNone.uncertain_state is True
+
+
+# --- process_closing ---
+
+def _setup_closed_pos(mon, actual_commission=None, entry_actual_commission=None,
+                      entry_price=100.0, exit_price=105.0, qty=1, lot=1,
+                      close_price_before_order=None):
+    pos = register_buy(mon, qty=qty, entry=entry_price, lot=lot)
+    pos.state = PositionState.CLOSED
+    pos.executed_lots = qty
+    pos.execution_price = exit_price
+    pos.close_reason = "TP"
+    pos.close_price_before_order = (
+        close_price_before_order if close_price_before_order is not None else exit_price
+    )
+    pos.close_requested_at = "2026-01-01T00:00:00+00:00"
+    pos.actual_commission = actual_commission
+    pos.entry_actual_commission = entry_actual_commission
+    return pos
+
+
+def _read_last_trade(csv_path):
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        rows = list(reader)
+    return rows[-1] if rows else None
+
+
+def _read_all_trades(csv_path):
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        return list(reader)
+
+
+@pytest.mark.asyncio
+async def test_process_closing_model_commission(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+
+    client = FakeClient()
+    mon = ExecutionMonitor(client)
+    _setup_closed_pos(mon, actual_commission=None, entry_actual_commission=None)
+
+    await main.process_closing(client, mon)
+    row = _read_last_trade(csv_path)
+    assert row is not None
+    assert row["commission_source"] == "model"
+    assert float(row["commission_rub"]) > 0
+    assert float(row["entry_commission_rub"]) > 0
+    assert float(row["exit_commission_rub"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_process_closing_actual_commission(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+
+    client = FakeClient()
+    mon = ExecutionMonitor(client)
+    _setup_closed_pos(mon, actual_commission=0.5, entry_actual_commission=0.5)
+
+    await main.process_closing(client, mon)
+    row = _read_last_trade(csv_path)
+    assert row is not None
+    assert row["commission_source"] == "actual"
+    assert float(row["actual_commission_rub"]) == pytest.approx(0.5)
+    assert float(row["commission_rub"]) == pytest.approx(1.0)
+    assert float(row["entry_commission_rub"]) == pytest.approx(0.5)
+    assert float(row["exit_commission_rub"]) == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_process_closing_mixed_commission_is_mixed(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+
+    client = FakeClient()
+    mon = ExecutionMonitor(client)
+    _setup_closed_pos(mon, actual_commission=0.5, entry_actual_commission=None)
+
+    await main.process_closing(client, mon)
+    row = _read_last_trade(csv_path)
+    assert row is not None
+    assert row["commission_source"] == "mixed"
+    assert float(row["actual_commission_rub"]) == pytest.approx(0.5)
+    assert float(row["exit_commission_rub"]) == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_process_closing_entry_and_exit_sum_to_total(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+
+    client = FakeClient()
+    mon = ExecutionMonitor(client)
+    _setup_closed_pos(mon, actual_commission=1.2, entry_actual_commission=0.8)
+
+    await main.process_closing(client, mon)
+    row = _read_last_trade(csv_path)
+    entry_c = float(row["entry_commission_rub"])
+    exit_c = float(row["exit_commission_rub"])
+    total_c = float(row["commission_rub"])
+    assert entry_c + exit_c == pytest.approx(total_c)
+    assert entry_c == pytest.approx(0.8)
+    assert exit_c == pytest.approx(1.2)
+
+
+@pytest.mark.asyncio
+async def test_process_closing_slippage_percent(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+
+    client = FakeClient()
+    mon = ExecutionMonitor(client)
+    pos = _setup_closed_pos(
+        mon, qty=10, lot=1,
+        entry_price=100.0, exit_price=105.0,
+        close_price_before_order=106.0,
+    )
+    pos.price_before_order = 99.0
+
+    await main.process_closing(client, mon)
+    row = _read_last_trade(csv_path)
+    assert float(row["slippage_rub"]) == pytest.approx(20.0)
+    expected_percent = 20.0 / 2050.0 * 100.0
+    assert float(row["slippage_percent"]) == pytest.approx(expected_percent, abs=1e-3)
+
+
+@pytest.mark.asyncio
+async def test_process_closing_cumulative_net_pnl(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+
+    client = FakeClient()
+    mon = ExecutionMonitor(client)
+
+    pos1 = _setup_closed_pos(mon, qty=100, lot=1, entry_price=100.0, exit_price=106.0,
+                             actual_commission=10.0, entry_actual_commission=0.0)
+    pos1.trade_id = "cum-1"
+    pos1.figi = "FIGI-1"
+    mon.positions["FIGI-1"] = pos1
+    await main.process_closing(client, mon)
+
+    mon.positions.clear()
+    pos2 = _setup_closed_pos(mon, qty=100, lot=1, entry_price=100.0, exit_price=97.6,
+                             actual_commission=10.0, entry_actual_commission=0.0)
+    pos2.trade_id = "cum-2"
+    pos2.figi = "FIGI-2"
+    mon.positions["FIGI-2"] = pos2
+    await main.process_closing(client, mon)
+
+    rows = _read_all_trades(csv_path)
+    assert len(rows) == 2
+    net1 = float(rows[0]["net_pnl_rub"])
+    net2 = float(rows[1]["net_pnl_rub"])
+    cum1 = float(rows[0]["cumulative_net_pnl_rub"])
+    cum2 = float(rows[1]["cumulative_net_pnl_rub"])
+    assert cum1 == pytest.approx(net1)
+    assert cum2 == pytest.approx(net1 + net2)
+
+
+@pytest.mark.asyncio
+async def test_process_closing_idempotent(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+
+    client = FakeClient()
+    mon = ExecutionMonitor(client)
+    pos = _setup_closed_pos(mon, actual_commission=None, entry_actual_commission=None)
+    pos.trade_id = "unique-tid-1"
+
+    await main.process_closing(client, mon)
+    await main.process_closing(client, mon)
+    await main.process_closing(client, mon)
+
+    rows = [r for r in _read_all_trades(csv_path) if r.get("trade_id") == "unique-tid-1"]
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_closing_trade_id_already_logged_marks_logged(monkeypatch, tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    monkeypatch.setattr(research_logger, "TRADES_FILE", str(csv_path))
+    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+    research_logger._ensure_files()
+    research_logger.log_trade({"trade_id": "dup-1", "ticker": "SBER"})
+
+    client = FakeClient()
+    mon = ExecutionMonitor(client)
+    pos = _setup_closed_pos(mon, actual_commission=None, entry_actual_commission=None)
+    pos.trade_id = "dup-1"
+
+    await main.process_closing(client, mon)
+    assert pos.logged is True
+
+    rows = [r for r in _read_all_trades(csv_path) if r.get("trade_id") == "dup-1"]
+    assert len(rows) == 1
